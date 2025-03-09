@@ -1,0 +1,735 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <TFT_eSPI.h>
+#include <time.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+// WLAN-Konfiguration
+const char* ssid = "DEIN_WLAN_NAME";
+const char* password = "DEIN_WLAN_PASSWORT";
+
+// MQTT-Konfiguration
+const char* mqtt_server = "DEIN_MQTT_SERVER";
+const int mqtt_port = 1883;
+const char* mqtt_user = "DEIN_MQTT_BENUTZERNAME";    // optional
+const char* mqtt_password = "DEIN_MQTT_PASSWORT";    // optional
+
+// MQTT-Topics (nur 2 verschiedene Topics)
+const char* topics[] = {
+  "nachricht1",
+  "nachricht2"
+};
+const int topicCount = 2; // Anzahl der zu abonnierenden Topics
+
+// Telegram Bot Konfiguration
+#define BOT_TOKEN "DEIN_TELEGRAM_BOT_TOKEN"  // Token von BotFather
+WiFiClientSecure telegramClient;
+UniversalTelegramBot bot(BOT_TOKEN, telegramClient);
+
+// Zugelassene Telegram-Benutzer (Chat-IDs)
+const String ALLOWED_USERS[] = {"DEINE_CHAT_ID"};  // Deine Telegram Chat-ID
+const int allowedUsersCount = 1;  // Anzahl der zugelassenen Benutzer
+
+// Intervall für die Telegram-Bot-Abfrage (in Millisekunden)
+const unsigned long BOT_CHECK_INTERVAL = 1000;
+unsigned long lastBotCheck = 0;
+
+// NTP-Konfiguration (Zeitserver)
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600;      // GMT+1 für Mitteleuropa (in Sekunden)
+const int daylightOffset_sec = 3600;  // Sommerzeit (in Sekunden)
+
+// Nachrichtenpuffer für die letzten 3 Nachrichten (1 pro Topic)
+#define MAX_MESSAGES 3  // 2 MQTT-Topics + 1 Telegram-Nachricht
+struct MessageData {
+  char topic[50];
+  char payload[100];
+  char timestamp[20];
+  bool isNew;
+  bool isUsed;  // Flag, ob dieser Slot bereits verwendet wird
+};
+
+MessageData messages[MAX_MESSAGES];  // Ein Eintrag pro Topic
+
+// Flag um anzuzeigen, dass neue Nachrichten verfügbar sind
+volatile bool newMessageReceived = false;
+
+// Konstanten für Farben definieren
+const uint32_t COLOR_BACKGROUND = TFT_BLACK;
+const uint32_t COLOR_TITLE = TFT_SKYBLUE;
+const uint32_t COLOR_TIME = 0xFFD700;  // Goldgelb
+const uint32_t COLOR_TOPIC = 0x00CED1;  // Dunkles Türkis
+const uint32_t COLOR_MESSAGE = TFT_WHITE;
+const uint32_t COLOR_HIGHLIGHT = 0x2E4053;  // Dunkleres Blau
+const uint32_t COLOR_DIVIDER = 0x34495E;  // Dunkelgrau mit Blaustich
+const uint32_t COLOR_STATUS_OK = 0x00FF00;  // Hellgrün
+const uint32_t COLOR_STATUS_ERROR = TFT_RED;
+const uint32_t COLOR_TELEGRAM = 0x2CA5E0;  // Telegram-Blau
+
+// Initialisierung der TFT-Anzeige
+TFT_eSPI tft = TFT_eSPI();
+
+// WLAN und MQTT Client
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Letzte Aktualisierungszeit der Anzeige
+unsigned long lastDisplayUpdate = 0;
+const long displayUpdateInterval = 60000;  // Aktualisierungsintervall in ms (60 Sekunden)
+
+// Variablen für die Anzeige-Aktualisierung
+char lastTimeStr[30] = "";
+
+// Vorinitialisierung für feste Nachrichtenslots
+void initMessageSlots() {
+  // Initialisiere alle Slots
+  for (int i = 0; i < MAX_MESSAGES; i++) {
+    messages[i].isUsed = false;
+    messages[i].topic[0] = '\0';
+    messages[i].payload[0] = '\0';
+    messages[i].timestamp[0] = '\0';
+    messages[i].isNew = false;
+  }
+  
+  // Slot 0 für Telegram vorbelegen
+  strcpy(messages[0].topic, "telegram");
+  strcpy(messages[0].payload, "Warte auf Telegram...");
+  messages[0].isUsed = true;
+  messages[0].isNew = true;
+  
+  // Slot 1 für nachricht1 vorbelegen
+  strcpy(messages[1].topic, "nachricht1");
+  strcpy(messages[1].payload, "Warte auf Nachrichten...");
+  messages[1].isUsed = true;
+  messages[1].isNew = true;
+  
+  // Slot 2 für nachricht2 vorbelegen
+  strcpy(messages[2].topic, "nachricht2");
+  strcpy(messages[2].payload, "Warte auf Nachrichten...");
+  messages[2].isUsed = true;
+  messages[2].isNew = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialisierung der TFT-Anzeige
+  tft.init();
+  tft.setRotation(3); // Portrait-Modus (90 Grad gedreht)
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  
+  // Startbildschirm mit Animation
+  tft.fillScreen(TFT_BLACK);
+  
+  // Logo-Effekt zeichnen
+  for (int radius = 1; radius <= 40; radius += 2) {
+    tft.drawCircle(tft.width()/2, tft.height()/2 - 20, radius, tft.color565(0, 0, 128 - radius*2));
+    delay(15);
+  }
+  
+  // Titel mit Animation einblenden
+  tft.setTextColor(TFT_SKYBLUE);
+  const char* titleText = "MQTT & Telegram Monitor";  // Geänderter Titel
+  int titleX = (tft.width() - tft.textWidth(titleText, 4)) / 2;
+  int titleY = tft.height()/2 - 40;
+  for (int i = 0; i < strlen(titleText); i++) {
+    char temp[2] = {titleText[i], '\0'};
+    tft.drawString(temp, titleX + i*tft.textWidth("A", 4), titleY, 4);
+    delay(50);
+  }
+  
+  // Untertitel einblenden
+  tft.setTextColor(TFT_WHITE);
+  const char* subTitleText = "Willkommen!";  // Geänderter Untertitel
+  int subTitleX = (tft.width() - tft.textWidth(subTitleText, 2)) / 2;
+  tft.drawString(subTitleText, subTitleX, titleY + 40, 2);
+  delay(500);
+  
+  // Verbindungshinweis
+  tft.drawString("Verbinde mit WLAN...", 10, tft.height() - 40, 2);
+  
+  // Initialisierung der Nachrichtenslots mit vordefinierten Werten
+  initMessageSlots();
+  
+  // Verbindung zum WLAN herstellen
+  setupWifi();
+  
+  // NTP konfigurieren (für Datum und Uhrzeit)
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Telegram Client konfigurieren
+  telegramClient.setCACert(TELEGRAM_CERTIFICATE_ROOT); // Telegram API Zertifikat
+  
+  // MQTT Client konfigurieren
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  // Verbindung zum MQTT Server herstellen
+  connectMQTT();
+  
+  // Fortschritt anzeigen
+  tft.fillRect(0, tft.height() - 40, tft.width(), 30, TFT_BLACK);
+  
+  // Statusanzeige mit Animation
+  const char* readyText = "Bereit für Nachrichten";
+  int readyWidth = tft.textWidth(readyText, 2);
+  int readyX = (tft.width() - readyWidth) / 2;
+  
+  // Fülleffekt für den Text
+  for (int i = 0; i <= readyWidth; i += 5) {
+    tft.fillRect(readyX, tft.height() - 40, i, 16, TFT_NAVY);
+    delay(10);
+  }
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString(readyText, readyX, tft.height() - 40, 2);
+  
+  delay(1000);
+  
+  // Grundlayout der Anzeige erstellen
+  updateDisplay();
+}
+
+void loop() {
+  // MQTT-Verbindung überprüfen und bei Bedarf wiederherstellen
+  if (!client.connected()) {
+    connectMQTT();
+  }
+  client.loop();
+  
+  // Telegram-Nachrichten abrufen
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastBotCheck >= BOT_CHECK_INTERVAL) {
+    lastBotCheck = currentMillis;
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    
+    if (numNewMessages > 0) {
+      handleNewTelegramMessages(numNewMessages);
+    }
+  }
+  
+  // Anzeige aktualisieren (Zeit wird nur jede Sekunde aktualisiert)
+  if (currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
+    lastDisplayUpdate = currentMillis;
+    updateDisplay();
+  }
+  
+  // Bei neuen Nachrichten sofort aktualisieren
+  if (newMessageReceived) {
+    updateDisplay();
+    newMessageReceived = false;
+  }
+}
+
+// Neue Funktion: Prüft, ob der Benutzer autorisiert ist
+bool isUserAuthorized(String chatId) {
+  for (int i = 0; i < allowedUsersCount; i++) {
+    if (chatId == ALLOWED_USERS[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Neue Funktion: Verarbeitet neue Telegram-Nachrichten
+void handleNewTelegramMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chatId = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+    String fromName = bot.messages[i].from_name;
+    
+    // Prüfe Autorisierung
+    if (!isUserAuthorized(chatId)) {
+      bot.sendMessage(chatId, "Zugriff verweigert. Du bist nicht autorisiert.", "");
+      continue;
+    }
+    
+    Serial.println("Autorisierte Nachricht empfangen: " + text);
+    
+    // /status Befehl - gibt Status des Systems zurück
+    if (text == "/status") {
+      String statusMessage = "WLAN: ";
+      statusMessage += (WiFi.status() == WL_CONNECTED) ? "Verbunden" : "Getrennt";
+      statusMessage += "\nMQTT: ";
+      statusMessage += client.connected() ? "Verbunden" : "Getrennt";
+      statusMessage += "\nIP: " + WiFi.localIP().toString();
+      
+      bot.sendMessage(chatId, statusMessage, "");
+    }
+    // /hilfe oder /help Befehl - zeigt verfügbare Befehle
+    else if (text == "/hilfe" || text == "/help") {
+      String helpMessage = "Verfügbare Befehle:\n";
+      helpMessage += "/status - Zeigt den Systemstatus\n";
+      helpMessage += "/nachricht <text> - Sendet eine Nachricht ans Display\n";
+      helpMessage += "/hilfe oder /help - Zeigt diese Hilfe";
+      
+      bot.sendMessage(chatId, helpMessage, "");
+    }
+    // /nachricht Befehl - sendet Text ans Display
+    else if (text.startsWith("/nachricht ")) {
+      String message = text.substring(11); // Länge von "/nachricht " abschneiden
+      
+      if (message.length() > 0) {
+        // Generiere Telegram-Topic
+        char topic[20] = "telegram";
+        
+        // Aktuelle Uhrzeit abrufen
+        struct tm timeinfo;
+        char timestamp[20];
+        if (getLocalTime(&timeinfo)) {
+          strftime(timestamp, sizeof(timestamp), "%d.%m %H:%M", &timeinfo);
+        } else {
+          strcpy(timestamp, "Zeit unbekannt");
+        }
+        
+        // Nachricht als MQTT-Nachricht für den Anzeige-Code behandeln
+        processMessage(topic, message.c_str(), timestamp, fromName);
+        
+        bot.sendMessage(chatId, "Nachricht zum Display gesendet!", "");
+      } else {
+        bot.sendMessage(chatId, "Bitte Text nach /nachricht eingeben!", "");
+      }
+    }
+    // Unbekannter Befehl
+    else {
+      bot.sendMessage(chatId, "Unbekannter Befehl. Sende /hilfe für verfügbare Befehle.", "");
+    }
+  }
+}
+
+// Neue Funktion: Verarbeitet eine Nachricht für das Display
+void processMessage(const char* topic, const char* payload, const char* timestamp, String fromName) {
+  // Feste Slots für die drei Nachrichtenkanäle
+  int index = -1;
+  
+  // Für "telegram" immer Slot 0 verwenden
+  if (strcmp(topic, "telegram") == 0) {
+    index = 0;
+  }
+  // Für "nachricht1" immer Slot 1 verwenden
+  else if (strcmp(topic, "nachricht1") == 0) {
+    index = 1;
+  }
+  // Für "nachricht2" immer Slot 2 verwenden
+  else if (strcmp(topic, "nachricht2") == 0) {
+    index = 2;
+  }
+  // Für unbekanntes Topic Slot 0 verwenden (Telegram-Slot)
+  else {
+    index = 0;
+  }
+  
+  // Slot als benutzt markieren und Topic speichern
+  messages[index].isUsed = true;
+  strncpy(messages[index].topic, topic, sizeof(messages[index].topic) - 1);
+  messages[index].topic[sizeof(messages[index].topic) - 1] = '\0';
+  
+  // Nachricht formatieren
+  char finalPayload[100];
+  // Falls von Telegram, füge Absendername zu Topic hinzu (nicht zur Nachricht selbst)
+  strncpy(finalPayload, payload, sizeof(finalPayload) - 1);
+  finalPayload[sizeof(finalPayload) - 1] = '\0';
+  
+  // Prüfe, ob sich der Payload geändert hat
+  if (strcmp(messages[index].payload, finalPayload) != 0) {
+    // Kopiere den neuen Payload
+    strncpy(messages[index].payload, finalPayload, sizeof(messages[index].payload) - 1);
+    messages[index].payload[sizeof(messages[index].payload) - 1] = '\0';
+    
+    // Aktualisiere den Zeitstempel
+    strncpy(messages[index].timestamp, timestamp, sizeof(messages[index].timestamp) - 1);
+    messages[index].timestamp[sizeof(messages[index].timestamp) - 1] = '\0';
+    
+    // Markiere als neu
+    messages[index].isNew = true;
+    
+    // Setze Flag für Display-Update
+    newMessageReceived = true;
+  }
+}
+
+void setupWifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Verbinde mit WLAN: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, password);
+  
+  // Verbindungsanimation
+  int connectionAttempts = 0;
+  int progressBarWidth = tft.width() - 60;
+  int progressBarX = 30;
+  int progressBarY = tft.height() - 25;
+  
+  // Zeichne Rahmen für Fortschrittsbalken
+  tft.drawRoundRect(progressBarX - 2, progressBarY - 2, 
+                   progressBarWidth + 4, 14, 3, TFT_LIGHTGREY);
+  
+  while (WiFi.status() != WL_CONNECTED && connectionAttempts < 20) {
+    delay(500);
+    Serial.print(".");
+    
+    // Fortschrittsbalken aktualisieren
+    int progressWidth = (connectionAttempts * progressBarWidth) / 20;
+    tft.fillRoundRect(progressBarX, progressBarY, 
+                     progressWidth, 10, 2, TFT_SKYBLUE);
+    
+    // Prozentanzeige
+    int percent = (connectionAttempts * 100) / 20;
+    String percentStr = String(percent) + "%";
+    tft.fillRect(progressBarX + progressBarWidth + 5, progressBarY - 2, 40, 14, TFT_BLACK);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(percentStr, progressBarX + progressBarWidth + 5, progressBarY, 1);
+    
+    connectionAttempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    // Vervollständige den Fortschrittsbalken
+    tft.fillRoundRect(progressBarX, progressBarY, progressBarWidth, 10, 2, TFT_SKYBLUE);
+    tft.fillRect(progressBarX + progressBarWidth + 5, progressBarY - 2, 40, 14, TFT_BLACK);
+    tft.drawString("100%", progressBarX + progressBarWidth + 5, progressBarY, 1);
+    
+    Serial.println("");
+    Serial.println("WLAN verbunden");
+    Serial.println("IP-Adresse: ");
+    Serial.println(WiFi.localIP());
+    
+    // Erfolgreiche Verbindung animieren
+    tft.fillRect(0, tft.height() - 40, tft.width(), 15, TFT_BLACK);
+    tft.setTextColor(TFT_GREEN);
+    
+    String connectedText = "Verbunden: " + WiFi.localIP().toString();
+    int connectedWidth = tft.textWidth(connectedText, 2);
+    int connectedX = (tft.width() - connectedWidth) / 2;
+    
+    // Text von links nach rechts animieren
+    for (int i = 0; i < connectedWidth + 1; i += 5) {
+      tft.fillRect(connectedX, progressBarY - 15, i, 14, TFT_BLACK);
+      tft.setCursor(connectedX, progressBarY - 15);
+      tft.setTextSize(1);
+      tft.setTextFont(2);
+      tft.setTextColor(TFT_GREEN);
+      tft.print(connectedText.substring(0, (i * connectedText.length()) / connectedWidth));
+      delay(5);
+    }
+    delay(500);
+    
+  } else {
+    Serial.println("");
+    Serial.println("WLAN-Verbindung fehlgeschlagen");
+    
+    // Fehleranimation
+    for (int i = 0; i < 3; i++) {
+      tft.fillRect(0, tft.height() - 40, tft.width(), 15, TFT_RED);
+      tft.setTextColor(TFT_WHITE);
+      tft.drawString("WLAN-Verbindung fehlgeschlagen!", 
+                    (tft.width() - tft.textWidth("WLAN-Verbindung fehlgeschlagen!", 2))/2, 
+                    tft.height() - 40, 2);
+      delay(500);
+      tft.fillRect(0, tft.height() - 40, tft.width(), 15, TFT_BLACK);
+      delay(500);
+    }
+    
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("Neustart in 3 Sekunden...", 
+                  (tft.width() - tft.textWidth("Neustart in 3 Sekunden...", 2))/2, 
+                  tft.height() - 40, 2);
+    delay(3000);
+    ESP.restart();
+  }
+}
+
+void connectMQTT() {
+  // Verbindung zum MQTT-Server herstellen
+  while (!client.connected()) {
+    Serial.print("Verbinde mit MQTT Server...");
+    
+    // Client-ID erstellen (sollte eindeutig sein)
+    String clientId = "ESP32CYD-";
+    clientId += String(random(0xffff), HEX);
+    
+    // Verbindung mit Benutzername und Passwort herstellen (falls konfiguriert)
+    bool connected = false;
+    if (strlen(mqtt_user) > 0 && strlen(mqtt_password) > 0) {
+      connected = client.connect(clientId.c_str(), mqtt_user, mqtt_password);
+    } else {
+      connected = client.connect(clientId.c_str());
+    }
+    
+    if (connected) {
+      Serial.println("verbunden");
+      
+      // Alle konfigurierten Topics abonnieren
+      for (int i = 0; i < topicCount; i++) {
+        client.subscribe(topics[i]);
+        Serial.print("Abonniert: ");
+        Serial.println(topics[i]);
+      }
+    } else {
+      Serial.print("Verbindung fehlgeschlagen, rc=");
+      Serial.print(client.state());
+      Serial.println(" Neuer Versuch in 5 Sekunden");
+      delay(5000);
+    }
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Nachricht empfangen [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  
+  char payloadStr[100];
+  if (length < 99) {
+    memcpy(payloadStr, payload, length);
+    payloadStr[length] = '\0';
+  } else {
+    memcpy(payloadStr, payload, 99);
+    payloadStr[99] = '\0';
+  }
+  
+  Serial.println(payloadStr);
+  
+  // Aktuelle Uhrzeit abrufen
+  struct tm timeinfo;
+  char timestamp[20];
+  if (getLocalTime(&timeinfo)) {
+    strftime(timestamp, sizeof(timestamp), "%d.%m %H:%M", &timeinfo);
+  } else {
+    strcpy(timestamp, "Zeit unbekannt");
+  }
+  
+  // Verarbeite Nachricht (ohne Telegram-Absender)
+  processMessage(topic, payloadStr, timestamp, "");
+}
+
+void updateDisplay() {
+  // Bei erster Ausführung oder bei MQTT-Reconnect komplettes Display zeichnen
+  static bool firstRun = true;
+  static bool lastMqttState = false;
+  bool currentMqttState = client.connected();
+  
+  if (firstRun || lastMqttState != currentMqttState) {
+    // Vollständige Neuzeichnung mit Hintergrund
+    tft.fillScreen(COLOR_BACKGROUND);
+    
+  // Kopfzeile mit Farbverlauf
+    for (int i = 0; i < 40; i++) {
+      // Farbverlauf von dunkel nach hell
+      uint32_t gradientColor = tft.color565(0, 0, 30 + i);
+      tft.drawFastHLine(0, i, tft.width(), gradientColor);
+    }
+    
+    // Titel mit Schattierung und Telegram-Icon
+    tft.setTextColor(COLOR_BACKGROUND);
+    tft.drawString("ESP32 MQTT & Telegram", 12, 12, 2);
+    tft.setTextColor(COLOR_TITLE);
+    tft.drawString("ESP32 MQTT & Telegram", 10, 10, 2);
+    
+    // Kleines Telegram-Icon
+    int iconX = tft.width() - 20;
+    int iconY = 10;
+    tft.fillCircle(iconX, iconY, 7, COLOR_TELEGRAM);
+    tft.fillCircle(iconX, iconY, 4, COLOR_BACKGROUND);
+    tft.fillTriangle(iconX - 3, iconY + 2, iconX - 1, iconY + 5, iconX + 1, iconY, COLOR_BACKGROUND);
+    
+    // Trennlinie mit 3D-Effekt
+    tft.drawFastHLine(0, 40, tft.width(), COLOR_DIVIDER + 0x303030);
+    tft.drawFastHLine(0, 41, tft.width(), COLOR_DIVIDER);
+    tft.drawFastHLine(0, 42, tft.width(), COLOR_DIVIDER - 0x303030);
+    
+    firstRun = false;
+    lastMqttState = currentMqttState;
+  }
+  
+  // Zeit aktualisieren
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char timeStr[30];
+    strftime(timeStr, sizeof(timeStr), "%d.%m.%Y %H:%M", &timeinfo);
+    
+    // Nur aktualisieren, wenn sich die Zeit geändert hat
+    if (strcmp(timeStr, lastTimeStr) != 0) {
+      // Bereich für Zeitanzeige löschen
+      tft.fillRect(10, 25, 220, 12, COLOR_BACKGROUND);
+      
+      // Zeitanzeige mit leichtem Schatten für 3D-Effekt
+      tft.setTextColor(COLOR_BACKGROUND + 0x303030);
+      tft.drawString(timeStr, 11, 25, 1);
+      tft.setTextColor(COLOR_TIME);
+      tft.drawString(timeStr, 10, 25, 1);
+      
+      // Zeit speichern
+      strcpy(lastTimeStr, timeStr);
+    }
+  }
+  
+  // Nachrichtenbereich aktualisieren
+  int displayY = 45;
+  int messageHeight = 60;  // Höhe reduziert, damit alle drei Nachrichten gut sichtbar sind
+  
+  // Feste Positionen für die drei definierten Nachrichtenslots
+  for (int i = 0; i < MAX_MESSAGES; i++) {
+    if (messages[i].isUsed) {
+      // Nur aktualisieren, wenn es eine neue Nachricht ist oder beim ersten Durchlauf
+      if (messages[i].isNew || firstRun) {
+        // Hintergrund für die Nachricht mit leichtem Farbverlauf
+        for (int y = 0; y < messageHeight - 1; y++) {
+          uint32_t gradientColor = COLOR_HIGHLIGHT;
+          if (y < 3) {
+            gradientColor += 0x101010 * (3-y);  // Oben etwas heller
+          } else if (y > messageHeight - 5) {
+            gradientColor -= 0x101010;  // Unten etwas dunkler
+          }
+          tft.drawFastHLine(0, displayY + y, tft.width(), gradientColor);
+        }
+        
+        // Abgerundete Ecken simulieren
+        tft.drawCircleHelper(5, displayY + 5, 5, 1, COLOR_BACKGROUND);
+        tft.drawCircleHelper(tft.width() - 5, displayY + 5, 5, 2, COLOR_BACKGROUND);
+        
+        // Topic mit Icon und Rahmen - Spezielle Farbe für Telegram
+        uint32_t topicColor = (strcmp(messages[i].topic, "telegram") == 0) ? COLOR_TELEGRAM : COLOR_TOPIC;
+        
+        tft.fillRoundRect(8, displayY + 6, 8, 8, 2, topicColor);
+        tft.setTextColor(topicColor);
+        
+        String topicStr = String(messages[i].topic);
+        
+        // Bei Telegram-Nachricht den Absender zum Topic hinzufügen, falls vorhanden
+        if (strcmp(messages[i].topic, "telegram") == 0) {
+          // Extrahiere den Namen aus dem Payload, falls vorhanden
+          String fromName = "Telegram"; // Standardwert
+          
+          // Zeige nur "Von: Name" anstatt "telegram" an
+          topicStr = "Von: " + fromName;
+        }
+        
+        // Kürze Topic falls zu lang
+        if (topicStr.length() > 18) {
+          topicStr = "..." + topicStr.substring(topicStr.length() - 15);
+        }
+        
+        tft.setTextFont(2);
+        tft.drawString(topicStr, 22, displayY + 6, 2);
+        
+        // Zeitstempel rechts ausgerichtet
+        tft.setTextFont(1);
+        tft.setTextColor(COLOR_TIME - 0x303030);
+        tft.drawString(messages[i].timestamp, tft.width() - 55, displayY + 6, 2);
+        
+        // Nachrichteninhalt in abgerundetem Rahmen (kompaktere Größe)
+        int payloadY = displayY + 22;
+        tft.drawRoundRect(5, payloadY, tft.width() - 10, 30, 4, COLOR_MESSAGE - 0x303030);
+        tft.setTextColor(COLOR_MESSAGE);
+        
+        String payloadStr = String(messages[i].payload);
+        
+        // Verbesserte Nachrichtenanzeige - immer eine Zeile, gut lesbar
+        tft.setTextSize(1);
+        tft.setTextFont(2);  // Mittlerer Font für gute Lesbarkeit und Platzoptimierung
+        
+        // Text kürzen, falls er zu lang ist
+        if (tft.textWidth(payloadStr, 2) > tft.width() - 20) {
+          int maxChars = payloadStr.length();
+          while (tft.textWidth(payloadStr.substring(0, maxChars) + "...", 2) > tft.width() - 20 && maxChars > 10) {
+            maxChars--;
+          }
+          payloadStr = payloadStr.substring(0, maxChars) + "...";
+        }
+        
+        // Zentriert darstellen für bessere Lesbarkeit
+        int textX = (tft.width() - tft.textWidth(payloadStr, 2)) / 2;
+        if (textX < 10) textX = 10; // Mindestens 10px Abstand
+        
+        tft.drawString(payloadStr, textX, payloadY + 14, 2);
+        
+        // Elegante Trennlinie mit Farbverlauf
+        for (int x = 0; x < tft.width(); x++) {
+          int distance = abs(x - tft.width()/2);
+          int maxDist = tft.width()/2;
+          int brightness = 0x303030 - ((distance * 0x303030) / maxDist);
+          tft.drawPixel(x, displayY + messageHeight - 1, COLOR_DIVIDER + brightness);
+        }
+        
+        // Nach Anzeige nicht mehr als neu markieren
+        messages[i].isNew = false;
+      }
+      
+      displayY += messageHeight;
+    }
+  }
+  
+  // Status nur aktualisieren, wenn sich der WLAN- oder MQTT-Status ändert
+  static bool lastWifiState = false;
+  bool currentWifiState = (WiFi.status() == WL_CONNECTED);
+  
+  if (firstRun || lastWifiState != currentWifiState || lastMqttState != currentMqttState) {
+    // Statusleiste mit Farbverlauf - 15px vom unteren Rand des Displays
+    int statusBarY = tft.height() - 15;
+    for (int y = 0; y < 15; y++) {
+      tft.drawFastHLine(0, statusBarY + y, tft.width(), 
+                        tft.color565(0, 0, 15 + y));
+    }
+    
+    // WLAN Status mit Icon
+    int statusX = 10;
+    if (currentWifiState) {
+      // WLAN-Icon (vereinfacht)
+      for (int i = 0; i < 2; i++) {
+        tft.drawCircleHelper(statusX, tft.height() - 6, i*2+1, 0x0F, COLOR_STATUS_OK - (i*0x002000));
+      }
+      tft.setTextColor(COLOR_STATUS_OK);
+      tft.drawString("WLAN", statusX + 8, tft.height() - 10, 1);
+    } else {
+      // X-Icon für Fehler
+      tft.drawLine(statusX - 2, tft.height() - 8, statusX + 2, tft.height() - 4, COLOR_STATUS_ERROR);
+      tft.drawLine(statusX - 2, tft.height() - 4, statusX + 2, tft.height() - 8, COLOR_STATUS_ERROR);
+      tft.setTextColor(COLOR_STATUS_ERROR);
+      tft.drawString("WLAN", statusX + 8, tft.height() - 10, 1);
+    }
+    
+    // Trennlinie
+    statusX += 40;
+    tft.drawFastVLine(statusX, tft.height() - 10, 6, TFT_DARKGREY);
+    statusX += 8;
+    
+    // MQTT Status mit Icon
+    if (currentMqttState) {
+      // Vereinfachtes Verbindungs-Icon
+      tft.fillRoundRect(statusX, tft.height() - 8, 2, 4, 1, COLOR_STATUS_OK);
+      tft.fillRoundRect(statusX + 4, tft.height() - 7, 2, 3, 1, COLOR_STATUS_OK);
+      tft.setTextColor(COLOR_STATUS_OK);
+      tft.drawString("MQTT", statusX + 10, tft.height() - 10, 1);
+    } else {
+      // X-Icon für Fehler
+      tft.drawLine(statusX - 2, tft.height() - 8, statusX + 2, tft.height() - 4, COLOR_STATUS_ERROR);
+      tft.drawLine(statusX - 2, tft.height() - 4, statusX + 2, tft.height() - 8, COLOR_STATUS_ERROR);
+      tft.setTextColor(COLOR_STATUS_ERROR);
+      tft.drawString("MQTT", statusX + 10, tft.height() - 10, 1);
+    }
+    
+    // Telegram Status mit Icon
+    statusX += 45;
+    tft.drawFastVLine(statusX, tft.height() - 10, 6, TFT_DARKGREY);
+    statusX += 8;
+    
+    // Telegram-Icon und Status
+    tft.fillCircle(statusX + 1, tft.height() - 6, 3, COLOR_TELEGRAM);
+    tft.setTextColor(COLOR_TELEGRAM);
+    tft.drawString("TG", statusX + 8, tft.height() - 10, 1);
+    
+    // IP-Adresse anzeigen
+    tft.setTextColor(TFT_LIGHTGREY);
+    String ipStr = WiFi.localIP().toString();
+    tft.drawString(ipStr, tft.width() - tft.textWidth(ipStr, 1) - 5, tft.height() - 10, 1);
+    
+    lastWifiState = currentWifiState;
+    lastMqttState = currentMqttState;
+  }
+}
